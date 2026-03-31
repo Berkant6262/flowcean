@@ -39,6 +39,7 @@ dependencies = [
   "polars-u64-idx>=1.32.3",
   "cloudpickle>=3.1.1",
   "rich>=14.1.0",
+  "matplotlib>=3.10.6",
 ]
 
 [project.optional-dependencies]
