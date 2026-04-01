@@ -29,20 +29,21 @@ from flowcean.sklearn import (
 
 logger = logging.getLogger(__name__)
 
+
 @dataclass
 class TwoTankState(OdeState):
-    h1: float #Füllstand Tank 1
-    h2: float #Füllstand Tank 2
+    h1: float  # Füllstand Tank 1
+    h2: float  # Füllstand Tank 2
 
     @override
     def as_numpy(self) -> NDArray[np.float64]:
-        return np.array([self.h1,self.h2])
-    
+        return np.array([self.h1, self.h2])
+
     @classmethod
     @override
     def from_numpy(cls, state: NDArray[np.float64]) -> Self:
-        return cls(state[0],state[1])
-        
+        return cls(state[0], state[1])
+
 
 @dataclass
 class TwoTank(OdeSystem[TwoTankState]):
@@ -71,7 +72,7 @@ class TwoTank(OdeSystem[TwoTankState]):
         self.Qf2 = Qf2
         self.Cvb = Cvb
         self.Cvo = Cvo
-        
+
     @override
     def flow(self, t: float, state: NDArray[np.float64]) -> NDArray[np.float64]:
         h1 = float(state[0])
@@ -86,8 +87,7 @@ class TwoTank(OdeSystem[TwoTankState]):
 
         return np.array([dh1dt, dh2dt], dtype=np.float64)
 
-    
-    
+
 def main() -> None:
     flowcean.cli.initialize()
 
@@ -100,7 +100,6 @@ def main() -> None:
         Cvb=1.5938e-4,
         Cvo=1.59640e-4,
         initial_state=TwoTankState(h1=0.0, h2=0.03),
-        # initial_t=0.0  # optional, weil Default
     )
 
     data_incremental = OdeEnvironment(
@@ -115,8 +114,72 @@ def main() -> None:
         ),
     )
 
-    df = collect(data_incremental, 20)      # aus Flowcean-DataFrame ein echtes polars.DataFrame machen
+    # Optional: Rohdaten anschauen
+    df = collect(data_incremental, 20)
     print(df)
+
+    # Daten für das Lernen
+    data = collect(data_incremental, 250) | SlidingWindow(window_size=3)
+
+    inputs = ["h1_0", "h1_1", "h2_0", "h2_1"]
+
+    # Gemeinsame Train/Test-Splits
+    train, test = TrainTestSplit(ratio=0.8, shuffle=False).split(data)
+    train_env = StreamingOfflineEnvironment(train, batch_size=1)
+
+    # ---------- Modell für h2 ----------
+    learner_h2 = RiverLearner(
+        model=tree.HoeffdingTreeRegressor(grace_period=50, max_depth=5),
+    )
+
+    t_start = datetime.now(tz=timezone.utc)
+    model_h2 = learn_incremental(
+        train_env,
+        learner_h2,
+        inputs,
+        ["h2_2"],
+    )
+    delta_t = datetime.now(tz=timezone.utc) - t_start
+    print(f"Learning h2 took {np.round(delta_t.microseconds / 1000, 1)} ms")
+
+    report_h2 = evaluate_offline(
+        model_h2,
+        test,
+        inputs,
+        ["h2_2"],
+        [MeanAbsoluteError(), MeanSquaredError()],
+    )
+    print("Report for h2_2:")
+    print(report_h2)
+
+    # ---------- Modell für h1 ----------
+    # Train-Environment neu aufsetzen, weil der erste Durchlauf es verbraucht hat
+    train_env_h1 = StreamingOfflineEnvironment(train, batch_size=1)
+
+    learner_h1 = RiverLearner(
+        model=tree.HoeffdingTreeRegressor(grace_period=50, max_depth=5),
+    )
+
+    t_start = datetime.now(tz=timezone.utc)
+    model_h1 = learn_incremental(
+        train_env_h1,
+        learner_h1,
+        inputs,
+        ["h1_2"],
+    )
+    delta_t = datetime.now(tz=timezone.utc) - t_start
+    print(f"Learning h1 took {np.round(delta_t.microseconds / 1000, 1)} ms")
+
+    report_h1 = evaluate_offline(
+        model_h1,
+        test,
+        inputs,
+        ["h1_2"],
+        [MeanAbsoluteError(), MeanSquaredError()],
+    )
+    print("Report for h1_2:")
+    print(report_h1)
+
 
 if __name__ == "__main__":
     main()
