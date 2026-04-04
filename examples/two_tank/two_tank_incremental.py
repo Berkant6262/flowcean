@@ -74,7 +74,7 @@ class TwoTank(OdeSystem[TwoTankState]):
         self.Cvo = Cvo
 
     @override
-    def flow(self, t: float, state: NDArray[np.float64]) -> NDArray[np.float64]:
+    def flow(self, t: float, state: NDArray[np.float64]) -> NDArray[np.float64]: #
         h1 = float(state[0])
         h2 = float(state[1])
 
@@ -182,4 +182,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    main() 
