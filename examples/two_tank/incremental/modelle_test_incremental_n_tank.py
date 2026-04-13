@@ -2,6 +2,7 @@ import logging
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import List
 
 import matplotlib.pyplot as plt
@@ -19,8 +20,17 @@ from flowcean.polars.environments.dataframe import collect
 from flowcean.river import RiverLearner
 from flowcean.sklearn import MeanAbsoluteError, MeanSquaredError
 
+# HoeffdingTree benötigt tiefe Rekursion bei großen Bäumen
 sys.setrecursionlimit(10000)
 logger = logging.getLogger(__name__)
+
+# Bilder immer im aktuellen Terminal-Ordner speichern
+OUTPUT_DIR = Path.cwd()
+
+
+# ─────────────────────────────────────────
+#  Datenstrukturen
+# ─────────────────────────────────────────
 
 
 @dataclass
@@ -47,8 +57,36 @@ class NTankState(OdeState):
 
 
 # ─────────────────────────────────────────
+#  Frame-Collector (kapselt Seiteneffekt)
+# ─────────────────────────────────────────
+
+
+class FrameCollector:
+    """Sammelt ODE-Ausgaben als Polars DataFrames ohne globalen Seiteneffekt."""
+
+    def __init__(self, n_tanks: int) -> None:
+        self.n_tanks = n_tanks
+        self.frames: List[pl.DataFrame] = []
+
+    def clear(self) -> None:
+        self.frames.clear()
+
+    def collect_frame(self, ts, xs) -> pl.DataFrame:
+        frame = pl.DataFrame({
+            "t": ts,
+            **{f"h{i+1}": [x.h[i] for x in xs] for i in range(self.n_tanks)},
+        })
+        self.frames.append(frame)
+        return frame
+
+    def concat(self) -> pl.DataFrame:
+        return pl.concat(self.frames)
+
+
+# ─────────────────────────────────────────
 #  Topologie 1: Linear (Kette)
 # ─────────────────────────────────────────
+
 
 class NTankLinear(OdeSystem[NTankState]):
 
@@ -73,7 +111,7 @@ class NTankLinear(OdeSystem[NTankState]):
         Q_between = np.zeros(max(n - 1, 0))
         for i in range(n - 1):
             eff = self.valves_between[i].effective()
-            Q_between[i] = self.C_between[i] * eff * np.sqrt(max(h[i] - h[i+1], 0.0))
+            Q_between[i] = self.C_between[i] * eff * np.sqrt(max(h[i] - h[i + 1], 0.0))
 
         Q_out = np.zeros(n)
         for i in range(n):
@@ -87,7 +125,7 @@ class NTankLinear(OdeSystem[NTankState]):
         else:
             dhdt[0] = (self.Qpmax - Q_leak[0] - Q_between[0] - Q_out[0]) / self.A
             for i in range(1, n - 1):
-                dhdt[i] = (Q_between[i-1] - Q_leak[i] - Q_between[i] - Q_out[i]) / self.A
+                dhdt[i] = (Q_between[i - 1] - Q_leak[i] - Q_between[i] - Q_out[i]) / self.A
             dhdt[-1] = (Q_between[-1] - Q_leak[-1] - Q_out[-1]) / self.A
 
         for i in range(n):
@@ -100,6 +138,7 @@ class NTankLinear(OdeSystem[NTankState]):
 # ─────────────────────────────────────────
 #  Topologie 2: Vollvermascht
 # ─────────────────────────────────────────
+
 
 class NTankFullyCoupled(OdeSystem[NTankState]):
 
@@ -158,63 +197,105 @@ class NTankFullyCoupled(OdeSystem[NTankState]):
 
 
 # ─────────────────────────────────────────
+#  Hilfsfunktion: System-Instanz erstellen
+# ─────────────────────────────────────────
+
+
+def build_system(topology: str, n_tanks: int,
+                 valves_between: List[Valve], valves_out: List[Valve]):
+    """Erstellt immer eine frische System-Instanz (Zustand = 0)."""
+    initial_state = NTankState(h=[0.0] * n_tanks)
+    if topology == "linear":
+        return NTankLinear(
+            n_tanks=n_tanks, A=0.0154, Qpmax=1e-2, Qf=1e-4,
+            C_between=[1.5938e-4] * (n_tanks - 1),
+            Cout=[1.59640e-4] * n_tanks,
+            valves_between=valves_between,
+            valves_out=valves_out,
+            initial_state=initial_state,
+        )
+    else:
+        n_between = n_tanks * (n_tanks - 1) // 2
+        return NTankFullyCoupled(
+            n_tanks=n_tanks, A=0.0154, Qpmax=1e-2, Qf=1e-4,
+            C_all=[1.5e-4] * n_between,
+            Cout=[1.59640e-4] * n_tanks,
+            valves_between=valves_between,
+            valves_out=valves_out,
+            initial_state=initial_state,
+        )
+
+
+# ─────────────────────────────────────────
 #  Ventil-Konfiguration
 # ─────────────────────────────────────────
+
 
 def configure_valve(label: str) -> Valve:
     print(f"\n  Ventil {label}")
     is_open = input("    Geöffnet? (j/n) [Standard: j]: ").strip().lower() != "n"
     if is_open:
-        try:
-            position = max(0.0, min(1.0, float(
-                input("    Öffnungsgrad (0.0–1.0) [Standard: 1.0]: ").strip()
-            )))
-        except ValueError:
-            position = 1.0
+        while True:
+            raw = input("    Öffnungsgrad (0.0–1.0) [Standard: 1.0]: ").strip()
+            if raw == "":
+                position = 1.0
+                break
+            try:
+                position = float(raw)
+                if 0.0 <= position <= 1.0:
+                    break
+                print("    ⚠ Wert muss zwischen 0.0 und 1.0 liegen.")
+            except ValueError:
+                print("    ⚠ Ungültige Eingabe, bitte eine Zahl eingeben.")
     else:
         position = 0.0
     return Valve(open=is_open, position=position)
 
 
-def configure_valves_between_linear(n_tanks):
+def configure_valves_between_linear(n_tanks: int) -> List[Valve]:
     print("\n── Zwischenventile (Tank i → Tank i+1) ──")
-    return [configure_valve(f"Tank {i+1} → Tank {i+2}") for i in range(n_tanks - 1)]
+    return [configure_valve(f"Tank {i + 1} → Tank {i + 2}") for i in range(n_tanks - 1)]
 
 
-def configure_valves_between_coupled(n_tanks):
+def configure_valves_between_coupled(n_tanks: int) -> List[Valve]:
     print("\n── Zwischenventile (alle Paare) ──")
     valves = []
     for i in range(n_tanks):
         for j in range(i + 1, n_tanks):
-            valves.append(configure_valve(f"Tank {i+1} ↔ Tank {j+1}"))
+            valves.append(configure_valve(f"Tank {i + 1} ↔ Tank {j + 1}"))
     return valves
 
 
-def configure_valves_out(n_tanks):
+def configure_valves_out(n_tanks: int) -> List[Valve]:
     print("\n── Auslassventile ──")
-    return [configure_valve(f"Auslass Tank {i+1}") for i in range(n_tanks)]
+    return [configure_valve(f"Auslass Tank {i + 1}") for i in range(n_tanks)]
 
 
-def print_valve_summary(valves_between, valves_out, topology, n_tanks):
+def print_valve_summary(valves_between: List[Valve], valves_out: List[Valve],
+                        topology: str, n_tanks: int) -> None:
     print("\n── Ventil-Übersicht ─────────────────────────")
     if topology == "linear":
         for i, v in enumerate(valves_between):
-            print(f"  Zwischenventil Tank {i+1}→{i+2}: {'offen' if v.open else 'ZU'}, Position={v.position:.2f}")
+            print(f"  Zwischenventil Tank {i + 1}→{i + 2}: "
+                  f"{'offen' if v.open else 'ZU'}, Position={v.position:.2f}")
     else:
         idx = 0
         for i in range(n_tanks):
             for j in range(i + 1, n_tanks):
                 v = valves_between[idx]
-                print(f"  Zwischenventil Tank {i+1}↔{j+1}: {'offen' if v.open else 'ZU'}, Position={v.position:.2f}")
+                print(f"  Zwischenventil Tank {i + 1}↔{j + 1}: "
+                      f"{'offen' if v.open else 'ZU'}, Position={v.position:.2f}")
                 idx += 1
     for i, v in enumerate(valves_out):
-        print(f"  Auslassventil  Tank {i+1}: {'offen' if v.open else 'ZU'}, Position={v.position:.2f}")
+        print(f"  Auslassventil  Tank {i + 1}: "
+              f"{'offen' if v.open else 'ZU'}, Position={v.position:.2f}")
     print("─────────────────────────────────────────────\n")
 
 
 # ─────────────────────────────────────────
-#  Modell-Auswahl  ← FIX: neural_net.activations statt river_act
+#  Modell-Auswahl
 # ─────────────────────────────────────────
+
 
 def build_learner(model_choice: str) -> RiverLearner:
     if model_choice == "mlp":
@@ -237,16 +318,30 @@ def build_learner(model_choice: str) -> RiverLearner:
 
 
 # ─────────────────────────────────────────
-#  Metriken sicher aus Report lesen
+#  Metriken aus Report lesen
 # ─────────────────────────────────────────
 
+
 def extract_metric(report_obj, metric_name: str, target: str) -> float:
+    """
+    Liest einen Metrikwert aus dem Report-Objekt.
+    Versucht zuerst direkten Attributzugriff, fällt auf String-Parsing zurück.
+    """
+    try:
+        return float(report_obj.metrics[metric_name][target])
+    except (AttributeError, KeyError, TypeError):
+        pass
+
     for line in str(report_obj).splitlines():
         if metric_name in line and target in line:
-            try:
-                return float(line.split()[-1])
-            except ValueError:
-                pass
+            parts = line.split()
+            for part in reversed(parts):
+                try:
+                    return float(part)
+                except ValueError:
+                    continue
+
+    logger.warning("Metrik '%s' für '%s' nicht gefunden.", metric_name, target)
     return 0.0
 
 
@@ -254,38 +349,40 @@ def extract_metric(report_obj, metric_name: str, target: str) -> float:
 #  Plot 1: Füllstände
 # ─────────────────────────────────────────
 
+
 def plot_sensor_data(df: pl.DataFrame, n_tanks: int, topology: str) -> None:
     colors = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
               "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf"]
     t = df["t"].to_numpy()
+    topo_label = "Linear (Kette)" if topology == "linear" else "Fully Coupled"
 
     fig, axes = plt.subplots(n_tanks, 1, figsize=(10, 3 * n_tanks), sharex=True)
     if n_tanks == 1:
         axes = [axes]
 
-    topo_label = "Linear (Kette)" if topology == "linear" else "Fully Coupled"
     fig.suptitle(f"Füllstände – Topologie: {topo_label}", fontsize=13, fontweight="bold")
 
     for i in range(n_tanks):
-        h_vals = df[f"h{i+1}"].to_numpy()
+        h_vals = df[f"h{i + 1}"].to_numpy()
         c = colors[i % len(colors)]
         axes[i].plot(t, h_vals, color=c, linewidth=1.8)
         axes[i].fill_between(t, h_vals, alpha=0.12, color=c)
         axes[i].axhline(0, color="gray", linewidth=0.8, linestyle="--")
         axes[i].set_ylabel("Füllstand h [m]", fontsize=9)
-        axes[i].set_title(f"Tank {i+1}", fontsize=10)
+        axes[i].set_title(f"Tank {i + 1}", fontsize=10)
         axes[i].grid(True, linestyle="--", alpha=0.4)
 
     axes[-1].set_xlabel("Zeit t [s]", fontsize=10)
     plt.tight_layout()
-    plt.savefig("sensor_plot.png", dpi=150, bbox_inches="tight")
-    print("\n→ sensor_plot.png gespeichert – Fenster schließen um fortzufahren!")
-    plt.show()
+    plt.savefig(OUTPUT_DIR / "sensor_plot.png", dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"→ sensor_plot.png gespeichert in {OUTPUT_DIR}")
 
 
 # ─────────────────────────────────────────
 #  Plot 2: Modellfehler
 # ─────────────────────────────────────────
+
 
 def plot_learning_results(results: dict, n_tanks: int, model_label: str) -> None:
     x = np.arange(n_tanks)
@@ -297,47 +394,71 @@ def plot_learning_results(results: dict, n_tanks: int, model_label: str) -> None
     bars1 = ax.bar(x - width / 2, mae_vals, width, label="MAE", color="#1f77b4", alpha=0.85)
     bars2 = ax.bar(x + width / 2, mse_vals, width, label="MSE", color="#d62728", alpha=0.85)
 
-    for bar in bars1:
-        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height(),
-                f"{bar.get_height():.4f}", ha="center", va="bottom", fontsize=8)
-    for bar in bars2:
-        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height(),
-                f"{bar.get_height():.4f}", ha="center", va="bottom", fontsize=8)
+    for bar in (*bars1, *bars2):
+        ax.text(
+            bar.get_x() + bar.get_width() / 2,
+            bar.get_height(),
+            f"{bar.get_height():.4f}",
+            ha="center", va="bottom", fontsize=8,
+        )
 
     ax.set_xlabel("Tank")
     ax.set_ylabel("Fehler")
     ax.set_title(f"Modellfehler pro Tank – {model_label}")
     ax.set_xticks(x)
-    ax.set_xticklabels([f"Tank {i+1}" for i in range(n_tanks)])
+    ax.set_xticklabels([f"Tank {i + 1}" for i in range(n_tanks)])
     ax.legend()
     ax.grid(axis="y", linestyle="--", alpha=0.4)
     plt.tight_layout()
-    plt.savefig("learning_results.png", dpi=150, bbox_inches="tight")
-    print("→ learning_results.png gespeichert")
-    plt.show()
+    plt.savefig(OUTPUT_DIR / "learning_results.png", dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"→ learning_results.png gespeichert in {OUTPUT_DIR}")
+
+
+# ─────────────────────────────────────────
+#  Eingabe-Hilfsfunktionen
+# ─────────────────────────────────────────
+
+
+def prompt_choice(prompt: str, valid: tuple) -> str:
+    while True:
+        val = input(prompt).strip().lower()
+        if val in valid:
+            return val
+        print(f"  ⚠ Bitte eine der folgenden Optionen eingeben: {valid}")
+
+
+def prompt_positive_int(prompt: str) -> int:
+    while True:
+        try:
+            val = int(input(prompt).strip())
+            if val > 0:
+                return val
+            print("  ⚠ Wert muss größer als 0 sein.")
+        except ValueError:
+            print("  ⚠ Bitte eine ganze Zahl eingeben.")
 
 
 # ─────────────────────────────────────────
 #  Hauptprogramm
 # ─────────────────────────────────────────
 
+
 def main() -> None:
     flowcean.cli.initialize()
 
-    topology = ""
-    while topology not in ("linear", "coupled"):
-        topology = input(
-            "Topologie wählen – 'linear' (Kette) oder 'coupled' (jeder mit jedem): "
-        ).strip().lower()
-
-    n_tanks = int(input("Wie viele Tanks sollen simuliert werden? "))
-    n_samples = int(input("Wie viele Samples sollen gesammelt werden? [Empfehlung: 3000] "))
-
-    model_choice = ""
-    while model_choice not in ("hoeffding", "mlp"):
-        model_choice = input(
-            "\nModell wählen – 'hoeffding' (HoeffdingTree) oder 'mlp' (Neuronales Netz): "
-        ).strip().lower()
+    topology = prompt_choice(
+        "Topologie wählen – 'linear' (Kette) oder 'coupled' (jeder mit jedem): ",
+        ("linear", "coupled"),
+    )
+    n_tanks = prompt_positive_int("Wie viele Tanks sollen simuliert werden? ")
+    n_samples = prompt_positive_int(
+        "Wie viele Samples sollen gesammelt werden? [Empfehlung: 3000] "
+    )
+    model_choice = prompt_choice(
+        "\nModell wählen – 'hoeffding' (HoeffdingTree) oder 'mlp' (Neuronales Netz): ",
+        ("hoeffding", "mlp"),
+    )
 
     model_label = (
         "HoeffdingTreeRegressor" if model_choice == "hoeffding"
@@ -350,9 +471,11 @@ def main() -> None:
     ).strip().lower()
 
     if use_custom == "j":
-        valves_between = (configure_valves_between_linear(n_tanks)
-                          if topology == "linear"
-                          else configure_valves_between_coupled(n_tanks))
+        valves_between = (
+            configure_valves_between_linear(n_tanks)
+            if topology == "linear"
+            else configure_valves_between_coupled(n_tanks)
+        )
         valves_out = configure_valves_out(n_tanks)
     else:
         n_between = n_tanks - 1 if topology == "linear" else n_tanks * (n_tanks - 1) // 2
@@ -361,60 +484,36 @@ def main() -> None:
 
     print_valve_summary(valves_between, valves_out, topology, n_tanks)
 
-    initial_levels = [0.0] * n_tanks
-    raw_frames: List[pl.DataFrame] = []
-
-    def map_to_dataframe(ts, xs) -> pl.DataFrame:
-        frame = pl.DataFrame({
-            "t": ts,
-            **{f"h{i+1}": [x.h[i] for x in xs] for i in range(n_tanks)},
-        })
-        raw_frames.append(frame)
-        return frame
-
-    if topology == "linear":
-        system = NTankLinear(
-            n_tanks=n_tanks, A=0.0154, Qpmax=1e-2, Qf=1e-4,
-            C_between=[1.5938e-4] * (n_tanks - 1),
-            Cout=[1.59640e-4] * n_tanks,
-            valves_between=valves_between, valves_out=valves_out,
-            initial_state=NTankState(h=initial_levels),
-        )
-        topo_label = "Linear"
-    else:
-        n_between = n_tanks * (n_tanks - 1) // 2
-        system = NTankFullyCoupled(
-            n_tanks=n_tanks, A=0.0154, Qpmax=1e-2, Qf=1e-4,
-            C_all=[1.5e-4] * n_between,
-            Cout=[1.59640e-4] * n_tanks,
-            valves_between=valves_between, valves_out=valves_out,
-            initial_state=NTankState(h=initial_levels),
-        )
-        topo_label = "Fully Coupled"
-
+    topo_label = "Linear" if topology == "linear" else "Fully Coupled"
     print(f"→ Topologie: {topo_label} | Tanks: {n_tanks} | "
           f"Zwischenventile: {len(valves_between)} | Auslassventile: {n_tanks}\n")
 
-    data_incremental = OdeEnvironment(system, dt=1.0, map_to_dataframe=map_to_dataframe)
-
+    # ── Vorschau (eigene System-Instanz, beeinflusst Hauptlauf nicht) ──
+    collector_preview = FrameCollector(n_tanks)
+    preview_system = build_system(topology, n_tanks, valves_between, valves_out)
+    data_preview = OdeEnvironment(
+        preview_system, dt=1.0, map_to_dataframe=collector_preview.collect_frame
+    )
     print("Vorschau auf die ersten 20 Schritte:")
-    print(collect(data_incremental, 20))
+    print(collect(data_preview, 20))
 
-    raw_frames.clear()
+    # ── Hauptsimulation (frische Instanz ab t=0) ──
+    collector = FrameCollector(n_tanks)
+    main_system = build_system(topology, n_tanks, valves_between, valves_out)
+    data_incremental = OdeEnvironment(
+        main_system, dt=1.0, map_to_dataframe=collector.collect_frame
+    )
     df_flowcean = collect(data_incremental, n_samples)
-    df_plot = pl.concat(raw_frames)
+    df_plot = collector.concat()
 
     # ── Plot 1: Füllstände ────────────────
     plot_sensor_data(df_plot, n_tanks, topology)
 
     # ── Training ──────────────────────────
+    # Features: die letzten 2 Zeitschritte pro Tank (Schritt _0 und _1),
+    # Ziel: nächster Schritt (_2). t wird bewusst nicht als Feature genutzt.
     data = df_flowcean | SlidingWindow(window_size=3)
-
-    inputs = []
-    for i in range(n_tanks):
-        inputs.append(f"h{i+1}_0")
-        inputs.append(f"h{i+1}_1")
-
+    inputs = [f"h{i + 1}_{step}" for i in range(n_tanks) for step in range(2)]
     train, test = TrainTestSplit(ratio=0.8, shuffle=False).split(data)
 
     results = {}
@@ -428,8 +527,8 @@ def main() -> None:
 
         t_start = datetime.now(tz=timezone.utc)
         model = learn_incremental(train_env, learner, inputs, [target_name])
-        delta_t = datetime.now(tz=timezone.utc) - t_start
-        print(f"Learning {target_name} took {np.round(delta_t.microseconds / 1000, 1)} ms")
+        elapsed_ms = round((datetime.now(tz=timezone.utc) - t_start).total_seconds() * 1000, 1)
+        print(f"Learning {target_name} took {elapsed_ms} ms")
 
         report = evaluate_offline(
             model, test, inputs, [target_name],
