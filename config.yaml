@@ -1,0 +1,30 @@
+mode: offline
+topology: linear
+n_tanks: 3
+n_samples: 250
+model: beide
+pumps:
+- 1.0
+- 1.0
+- 1.0
+h_target:
+- 200.0
+- 200.0
+- 200.0
+areas:
+- 1.0
+- 1.0
+- 1.0
+noise_std: 0.0
+valves_between:
+- open: true
+  position: 1.0
+- open: true
+  position: 1.0
+valves_out:
+- open: true
+  position: 1.0
+- open: true
+  position: 1.0
+- open: true
+  position: 1.0

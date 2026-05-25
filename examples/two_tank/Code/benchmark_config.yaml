@@ -1,0 +1,20 @@
+# ══════════════════════════════════════════════════════════════════════════════
+#  Benchmark – Skalierbarkeit MIT Rauschen (σ = 0.05)
+#  → Kapitel 5.4: Robustheit unter Sensorrauschen
+#  Verwendung: python benchmark.py benchmark_config_sigma005.yaml
+# ══════════════════════════════════════════════════════════════════════════════
+
+tank_sizes: [2, 3, 4, 5, 6, 8]
+topologies: ["linear", "coupled"]
+modes: ["offline", "incremental"]
+
+offline_model: "tree"
+incremental_model: "hoeffding"
+
+n_samples_offline: 5000
+n_samples_incremental: 5000
+
+h_target_per_tank: 200.0
+area_per_tank: 1.0
+qpmax_per_tank: 1.0
+noise_std: 0.05

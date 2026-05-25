@@ -1,0 +1,43 @@
+# ══════════════════════════════════════════════════════════════════════════════
+#  config.yaml – N=4, linear, offline  (Weg-B-Versuch: Leckage-Sprung)
+#  Ziel: schwarze Offline-Kurve soll nach t=500 sichtbar ansteigen
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── Grundkonfiguration ────────────────────────────────────────────────────────
+mode:       offline
+topology:   linear
+n_tanks:    4
+model:      beide
+n_samples:  5000
+noise_std:  0.0
+
+# ── Physikalische Parameter ───────────────────────────────────────────────────
+pumps:      [1.0, 1.0, 1.0, 1.0]
+h_target:   [200, 200, 200, 200]
+areas:      [1.0, 1.0, 1.0, 1.0]
+
+# ── Ventile (linear, N=4 -> 3 zwischen, 4 Auslass) ────────────────────────────
+valves_between:
+  - {open: true, position: 1.0}
+  - {open: true, position: 1.0}
+  - {open: true, position: 1.0}
+valves_out:
+  - {open: true, position: 1.0}
+  - {open: true, position: 1.0}
+  - {open: true, position: 1.0}
+  - {open: true, position: 1.0}
+
+# ── Störfall-Szenarien (5.6) – unverändert ────────────────────────────────────
+n_samples_fault: 500
+faults:
+  - {type: "valve_stuck",   time: 425, idx: 0, magnitude: 0.0}
+  - {type: "pump_failure",  time: 425, idx: 0, magnitude: 0.0}
+  - {type: "leak_increase", time: 425, idx: 0, magnitude: 20.0}
+
+# ── Parametersprung (5.7 / Abb. 5.9) – HIER der Leckage-Sprung ────────────────
+show_parameter_jump: true
+n_samples_jump:      1500
+jump_time:           500.0
+jump_fault_type:     "leak_increase"   # <- ändert die Dynamik selbst
+jump_magnitude:      6.0               # ×6 Leckage  (bei Bedarf 8.0 / 10.0 testen)
+jump_rolling_window: 30
